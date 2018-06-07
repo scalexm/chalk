@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeSet, BTreeMap};
 
 use chalk_parse::ast::*;
 use lalrpop_intern::intern;
@@ -10,102 +10,9 @@ use itertools::Itertools;
 use solve::SolverChoice;
 
 mod test;
+mod env;
 
-type TypeIds = BTreeMap<ir::Identifier, ir::ItemId>;
-type TypeKinds = BTreeMap<ir::ItemId, ir::TypeKind>;
-type AssociatedTyInfos = BTreeMap<(ir::ItemId, ir::Identifier), AssociatedTyInfo>;
-type ParameterMap = BTreeMap<ir::ParameterKind<ir::Identifier>, usize>;
-
-#[derive(Clone, Debug)]
-struct Env<'k> {
-    type_ids: &'k TypeIds,
-    type_kinds: &'k TypeKinds,
-    associated_ty_infos: &'k AssociatedTyInfos,
-    parameter_map: ParameterMap,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct AssociatedTyInfo {
-    id: ir::ItemId,
-    addl_parameter_kinds: Vec<ir::ParameterKind<ir::Identifier>>,
-}
-
-enum NameLookup {
-    Type(ir::ItemId),
-    Parameter(usize),
-}
-
-enum LifetimeLookup {
-    Parameter(usize),
-}
-
-const SELF: &str = "Self";
-
-impl<'k> Env<'k> {
-    fn lookup(&self, name: Identifier) -> Result<NameLookup> {
-        if let Some(k) = self.parameter_map.get(&ir::ParameterKind::Ty(name.str)) {
-            return Ok(NameLookup::Parameter(*k));
-        }
-
-        if let Some(id) = self.type_ids.get(&name.str) {
-            return Ok(NameLookup::Type(*id));
-        }
-
-        bail!(ErrorKind::InvalidTypeName(name))
-    }
-
-    fn lookup_lifetime(&self, name: Identifier) -> Result<LifetimeLookup> {
-        if let Some(k) = self.parameter_map
-            .get(&ir::ParameterKind::Lifetime(name.str))
-        {
-            return Ok(LifetimeLookup::Parameter(*k));
-        }
-
-        bail!("invalid lifetime name: {:?}", name.str);
-    }
-
-    fn type_kind(&self, id: ir::ItemId) -> &ir::TypeKind {
-        &self.type_kinds[&id]
-    }
-
-    /// Introduces new parameters, shifting the indices of existing
-    /// parameters to accommodate them. The indices of the new binders
-    /// will be assigned in order as they are iterated.
-    fn introduce<I>(&self, binders: I) -> Result<Self>
-    where
-        I: IntoIterator<Item = ir::ParameterKind<ir::Identifier>>,
-        I::IntoIter: ExactSizeIterator,
-    {
-        let binders = binders.into_iter().enumerate().map(|(i, k)| (k, i));
-        let len = binders.len();
-        let parameter_map: ParameterMap = self.parameter_map
-            .iter()
-            .map(|(&k, &v)| (k, v + len))
-            .chain(binders)
-            .collect();
-        if parameter_map.len() != self.parameter_map.len() + len {
-            bail!("duplicate parameters");
-        }
-        Ok(Env {
-            parameter_map,
-            ..*self
-        })
-    }
-
-    fn in_binders<I, T, OP>(&self, binders: I, op: OP) -> Result<ir::Binders<T>>
-    where
-        I: IntoIterator<Item = ir::ParameterKind<ir::Identifier>>,
-        I::IntoIter: ExactSizeIterator,
-        OP: FnOnce(&Self) -> Result<T>,
-    {
-        let binders: Vec<_> = binders.into_iter().collect();
-        let env = self.introduce(binders.iter().cloned())?;
-        Ok(ir::Binders {
-            binders: binders.anonymize(),
-            value: op(&env)?,
-        })
-    }
-}
+use self::env::*;
 
 pub trait LowerProgram {
     /// Lowers from a Program AST to the internal IR for a program.
@@ -163,12 +70,7 @@ impl LowerProgram for Program {
         let mut custom_clauses = Vec::new();
         let mut lang_items = BTreeMap::new();
         for (item, &item_id) in self.items.iter().zip(&item_ids) {
-            let empty_env = Env {
-                type_ids: &type_ids,
-                type_kinds: &type_kinds,
-                associated_ty_infos: &associated_ty_infos,
-                parameter_map: BTreeMap::new(),
-            };
+            let empty_env = Env::empty(&type_ids, &type_kinds, &associated_ty_infos);
 
             match *item {
                 Item::StructDefn(ref d) => {
@@ -182,7 +84,7 @@ impl LowerProgram for Program {
 
                         let mut parameter_kinds = defn.all_parameters();
                         parameter_kinds.extend(d.all_parameters());
-                        let env = empty_env.introduce(parameter_kinds.clone())?;
+                        let mut env = empty_env.introduce(parameter_kinds.clone())?;
 
                         associated_ty_data.insert(
                             info.id,
@@ -191,8 +93,8 @@ impl LowerProgram for Program {
                                 id: info.id,
                                 name: defn.name.str,
                                 parameter_kinds: parameter_kinds,
-                                bounds: defn.bounds.lower(&env)?,
-                                where_clauses: defn.where_clauses.lower(&env)?,
+                                bounds: defn.bounds.lower(&mut env)?,
+                                where_clauses: defn.where_clauses.lower(&mut env)?,
                             },
                         );
                     }
@@ -208,10 +110,10 @@ impl LowerProgram for Program {
                     }
                 }
                 Item::Impl(ref d) => {
-                    impl_data.insert(item_id, d.lower_impl(&empty_env)?);
+                    impl_data.insert(item_id, d.lower_impl(&mut empty_env)?);
                 }
                 Item::Clause(ref clause) => {
-                    custom_clauses.extend(clause.lower_clause(&empty_env)?);
+                    custom_clauses.extend(clause.lower_clause(&mut empty_env)?);
                 }
             }
         }
@@ -361,7 +263,7 @@ impl LowerParameterKind for ParameterKind {
 trait LowerWhereClauses {
     fn where_clauses(&self) -> &[QuantifiedWhereClause];
 
-    fn lower_where_clauses(&self, env: &Env) -> Result<Vec<ir::QuantifiedWhereClause>> {
+    fn lower_where_clauses(&self, env: &mut Env) -> Result<Vec<ir::QuantifiedWhereClause>> {
         self.where_clauses().lower(env)
     }
 }
@@ -413,17 +315,17 @@ impl LowerWhereClauses for Impl {
 }
 
 trait LowerWhereClauseVec<T> {
-    fn lower(&self, env: &Env) -> Result<Vec<T>>;
+    fn lower(&self, env: &mut Env) -> Result<Vec<T>>;
 }
 
 impl LowerWhereClauseVec<ir::WhereClause> for [WhereClause] {
-    fn lower(&self, env: &Env) -> Result<Vec<ir::WhereClause>> {
+    fn lower(&self, env: &mut Env) -> Result<Vec<ir::WhereClause>> {
         self.iter().flat_map(|wc| wc.lower(env).apply_result()).collect()
     }
 }
 
 impl LowerWhereClauseVec<ir::QuantifiedWhereClause> for [QuantifiedWhereClause] {
-    fn lower(&self, env: &Env) -> Result<Vec<ir::QuantifiedWhereClause>> {
+    fn lower(&self, env: &mut Env) -> Result<Vec<ir::QuantifiedWhereClause>> {
         self.iter()
             .flat_map(|wc| match wc.lower(env) {
                 Ok(v) => v.into_iter().map(Ok).collect(),
@@ -438,11 +340,11 @@ trait LowerWhereClause<T> {
     /// Some AST `where` clauses can lower to multiple ones, this is why we return a `Vec`.
     /// As for now, this is the only the case for `where T: Foo<Item = U>` which lowers to
     /// `Implemented(T: Foo)` and `ProjectionEq(<T as Foo>::Item = U)`.
-    fn lower(&self, env: &Env) -> Result<Vec<T>>;
+    fn lower(&self, env: &mut Env) -> Result<Vec<T>>;
 }
 
 impl LowerWhereClause<ir::WhereClause> for WhereClause {
-    fn lower(&self, env: &Env) -> Result<Vec<ir::WhereClause>> {
+    fn lower(&self, env: &mut Env) -> Result<Vec<ir::WhereClause>> {
         let where_clauses = match self {
             WhereClause::Implemented { trait_ref } => {
                 vec![ir::WhereClause::Implemented(trait_ref.lower(env)?)]
@@ -465,7 +367,7 @@ impl LowerWhereClause<ir::WhereClause> for WhereClause {
 }
 
 impl LowerWhereClause<ir::QuantifiedWhereClause> for QuantifiedWhereClause {
-    fn lower(&self, env: &Env) -> Result<Vec<ir::QuantifiedWhereClause>> {
+    fn lower(&self, env: &mut Env) -> Result<Vec<ir::QuantifiedWhereClause>> {
         let parameter_kinds = self.parameter_kinds.iter().map(|pk| pk.lower());
         let binders = env.in_binders(parameter_kinds, |env| {
             Ok(self.where_clause.lower(env)?)
@@ -475,11 +377,11 @@ impl LowerWhereClause<ir::QuantifiedWhereClause> for QuantifiedWhereClause {
 }
 
 trait LowerDomainGoal {
-    fn lower(&self, env: &Env) -> Result<Vec<ir::DomainGoal>>;
+    fn lower(&self, env: &mut Env) -> Result<Vec<ir::DomainGoal>>;
 }
 
 impl LowerDomainGoal for DomainGoal {
-    fn lower(&self, env: &Env) -> Result<Vec<ir::DomainGoal>> {
+    fn lower(&self, env: &mut Env) -> Result<Vec<ir::DomainGoal>> {
         let goals = match self {
             DomainGoal::Holds { where_clause } => {
                 where_clause.lower(env)?.into_iter().casted().collect()
@@ -539,11 +441,11 @@ impl LowerDomainGoal for DomainGoal {
 }
 
 trait LowerLeafGoal {
-    fn lower(&self, env: &Env) -> Result<Vec<ir::LeafGoal>>;
+    fn lower(&self, env: &mut Env) -> Result<Vec<ir::LeafGoal>>;
 }
 
 impl LowerLeafGoal for LeafGoal {
-    fn lower(&self, env: &Env) -> Result<Vec<ir::LeafGoal>> {
+    fn lower(&self, env: &mut Env) -> Result<Vec<ir::LeafGoal>> {
         let goals = match self {
             LeafGoal::DomainGoal { goal } => {
                 goal.lower(env)?
@@ -614,27 +516,30 @@ fn check_type_kinds<A: Kinded, B: Kinded>(msg: &str, expected: &A, actual: &B) -
 }
 
 trait LowerTraitRef {
-    fn lower(&self, env: &Env) -> Result<ir::TraitRef>;
+    fn lower(&self, env: &mut Env) -> Result<ir::TraitRef>;
 }
 
 impl LowerTraitRef for TraitRef {
-    fn lower(&self, env: &Env) -> Result<ir::TraitRef> {
+    fn lower(&self, env: &mut Env) -> Result<ir::TraitRef> {
         let without_self = TraitBound {
             trait_name: self.trait_name,
             args_no_self: self.args.iter().cloned().skip(1).collect(),
         }.lower(env)?;
 
+
         let self_parameter = self.args[0].lower(env)?;
-        Ok(without_self.as_trait_ref(self_parameter.ty().unwrap()))
+        let trait_ref = without_self.as_trait_ref(self_parameter.ty().unwrap());
+        env.trait_in_scope(trait_ref.clone());
+        Ok(trait_ref)
     }
 }
 
 trait LowerTraitBound {
-    fn lower(&self, env: &Env) -> Result<ir::TraitBound>;
+    fn lower(&self, env: &mut Env) -> Result<ir::TraitBound>;
 }
 
 impl LowerTraitBound for TraitBound {
-    fn lower(&self, env: &Env) -> Result<ir::TraitBound> {
+    fn lower(&self, env: &mut Env) -> Result<ir::TraitBound> {
         let id = match env.lookup(self.trait_name)? {
             NameLookup::Type(id) => id,
             NameLookup::Parameter(_) => bail!(ErrorKind::NotTrait(self.trait_name)),
@@ -670,13 +575,13 @@ impl LowerTraitBound for TraitBound {
 }
 
 trait LowerProjectionEqBound {
-    fn lower(&self, env: &Env) -> Result<ir::ProjectionEqBound>;
+    fn lower(&self, env: &mut Env) -> Result<ir::ProjectionEqBound>;
 }
 
 impl LowerProjectionEqBound for ProjectionEqBound {
-    fn lower(&self, env: &Env) -> Result<ir::ProjectionEqBound> {
+    fn lower(&self, env: &mut Env) -> Result<ir::ProjectionEqBound> {
         let trait_bound = self.trait_bound.lower(env)?;
-        let info = match env.associated_ty_infos.get(&(trait_bound.trait_id, self.name.str)) {
+        let info = match env.get_assoc_ty_info(&(trait_bound.trait_id, self.name.str)) {
             Some(info) => info,
             None => bail!("no associated type `{}` defined in trait", self.name.str),
         };
@@ -704,17 +609,17 @@ impl LowerProjectionEqBound for ProjectionEqBound {
 }
 
 trait LowerInlineBound {
-    fn lower(&self, env: &Env) -> Result<ir::InlineBound>;
+    fn lower(&self, env: &mut Env) -> Result<ir::InlineBound>;
 }
 
 impl LowerInlineBound for InlineBound {
-    fn lower(&self, env: &Env) -> Result<ir::InlineBound> {
+    fn lower(&self, env: &mut Env) -> Result<ir::InlineBound> {
         let bound = match self {
             InlineBound::TraitBound(b) => ir::InlineBound::TraitBound(
-                b.lower(&env)?
+                b.lower(env)?
             ),
             InlineBound::ProjectionEqBound(b) => ir::InlineBound::ProjectionEqBound(
-                b.lower(&env)?
+                b.lower(env)?
             ),
         };
         Ok(bound)
@@ -722,11 +627,11 @@ impl LowerInlineBound for InlineBound {
 }
 
 trait LowerInlineBounds {
-    fn lower(&self, env: &Env) -> Result<Vec<ir::InlineBound>>;
+    fn lower(&self, env: &mut Env) -> Result<Vec<ir::InlineBound>>;
 }
 
 impl LowerInlineBounds for Vec<InlineBound> {
-    fn lower(&self, env: &Env) -> Result<Vec<ir::InlineBound>> {
+    fn lower(&self, env: &mut Env) -> Result<Vec<ir::InlineBound>> {
         self.iter()
             .map(|b| b.lower(env))
             .collect()
@@ -734,11 +639,11 @@ impl LowerInlineBounds for Vec<InlineBound> {
 }
 
 trait LowerPolarizedTraitRef {
-    fn lower(&self, env: &Env) -> Result<ir::PolarizedTraitRef>;
+    fn lower(&self, env: &mut Env) -> Result<ir::PolarizedTraitRef>;
 }
 
 impl LowerPolarizedTraitRef for PolarizedTraitRef {
-    fn lower(&self, env: &Env) -> Result<ir::PolarizedTraitRef> {
+    fn lower(&self, env: &mut Env) -> Result<ir::PolarizedTraitRef> {
         Ok(match *self {
             PolarizedTraitRef::Positive(ref tr) => ir::PolarizedTraitRef::Positive(tr.lower(env)?),
             PolarizedTraitRef::Negative(ref tr) => ir::PolarizedTraitRef::Negative(tr.lower(env)?),
@@ -747,11 +652,11 @@ impl LowerPolarizedTraitRef for PolarizedTraitRef {
 }
 
 trait LowerProjectionTy {
-    fn lower(&self, env: &Env) -> Result<ir::ProjectionTy>;
+    fn lower(&self, env: &mut Env) -> Result<ir::ProjectionTy>;
 }
 
 impl LowerProjectionTy for ProjectionTy {
-    fn lower(&self, env: &Env) -> Result<ir::ProjectionTy> {
+    fn lower(&self, env: &mut Env) -> Result<ir::ProjectionTy> {
         let ProjectionTy {
             ref trait_ref,
             ref name,
@@ -761,7 +666,7 @@ impl LowerProjectionTy for ProjectionTy {
             trait_id,
             parameters: trait_parameters,
         } = trait_ref.lower(env)?;
-        let info = match env.associated_ty_infos.get(&(trait_id, name.str)) {
+        let info = match env.get_assoc_ty_info(&(trait_id, name.str)) {
             Some(info) => info,
             None => bail!("no associated type `{}` defined in trait", name.str),
         };
@@ -789,11 +694,11 @@ impl LowerProjectionTy for ProjectionTy {
 }
 
 trait LowerUnselectedProjectionTy {
-    fn lower(&self, env: &Env) -> Result<ir::UnselectedProjectionTy>;
+    fn lower(&self, env: &mut Env) -> Result<ir::UnselectedProjectionTy>;
 }
 
 impl LowerUnselectedProjectionTy for UnselectedProjectionTy {
-    fn lower(&self, env: &Env) -> Result<ir::UnselectedProjectionTy> {
+    fn lower(&self, env: &mut Env) -> Result<ir::UnselectedProjectionTy> {
         let parameters: Vec<_> = try!(self.args.iter().map(|a| a.lower(env)).collect());
         let ret = ir::UnselectedProjectionTy {
             type_name: self.name.str,
@@ -804,11 +709,11 @@ impl LowerUnselectedProjectionTy for UnselectedProjectionTy {
 }
 
 trait LowerTy {
-    fn lower(&self, env: &Env) -> Result<ir::Ty>;
+    fn lower(&self, env: &mut Env) -> Result<ir::Ty>;
 }
 
 impl LowerTy for Ty {
-    fn lower(&self, env: &Env) -> Result<ir::Ty> {
+    fn lower(&self, env: &mut Env) -> Result<ir::Ty> {
         match *self {
             Ty::Id { name } => match env.lookup(name)? {
                 NameLookup::Type(id) => {
@@ -868,13 +773,13 @@ impl LowerTy for Ty {
                 ref lifetime_names,
                 ref ty,
             } => {
-                let quantified_env = env.introduce(
+                let mut quantified_env = env.introduce(
                     lifetime_names
                         .iter()
                         .map(|id| ir::ParameterKind::Lifetime(id.str)),
                 )?;
 
-                let ty = ty.lower(&quantified_env)?;
+                let ty = ty.lower(&mut quantified_env)?;
                 let quantified_ty = ir::QuantifiedTy {
                     num_binders: lifetime_names.len(),
                     ty,
@@ -886,11 +791,11 @@ impl LowerTy for Ty {
 }
 
 trait LowerParameter {
-    fn lower(&self, env: &Env) -> Result<ir::Parameter>;
+    fn lower(&self, env: &mut Env) -> Result<ir::Parameter>;
 }
 
 impl LowerParameter for Parameter {
-    fn lower(&self, env: &Env) -> Result<ir::Parameter> {
+    fn lower(&self, env: &mut Env) -> Result<ir::Parameter> {
         match *self {
             Parameter::Ty(ref t) => Ok(ir::ParameterKind::Ty(t.lower(env)?)),
             Parameter::Lifetime(ref l) => Ok(ir::ParameterKind::Lifetime(l.lower(env)?)),
@@ -913,11 +818,11 @@ impl LowerLifetime for Lifetime {
 }
 
 trait LowerImpl {
-    fn lower_impl(&self, empty_env: &Env) -> Result<ir::ImplDatum>;
+    fn lower_impl(&self, empty_env: &mut Env) -> Result<ir::ImplDatum>;
 }
 
 impl LowerImpl for Impl {
-    fn lower_impl(&self, empty_env: &Env) -> Result<ir::ImplDatum> {
+    fn lower_impl(&self, empty_env: &mut Env) -> Result<ir::ImplDatum> {
         let binders = empty_env.in_binders(self.all_parameters(), |env| {
             let trait_ref = self.trait_ref.lower(env)?;
 
@@ -926,7 +831,7 @@ impl LowerImpl for Impl {
             }
 
             let trait_id = trait_ref.trait_ref().trait_id;
-            let where_clauses = self.lower_where_clauses(&env)?;
+            let where_clauses = self.lower_where_clauses(env)?;
             let associated_ty_values = try!(
                 self.assoc_ty_values
                     .iter()
@@ -994,7 +899,7 @@ trait LowerAssocTyValue {
 
 impl LowerAssocTyValue for AssocTyValue {
     fn lower(&self, trait_id: ir::ItemId, env: &Env) -> Result<ir::AssociatedTyValue> {
-        let info = &env.associated_ty_infos[&(trait_id, self.name.str)];
+        let info = env.get_assoc_ty_info(&(trait_id, self.name.str)).unwrap();
         let value = env.in_binders(self.all_parameters(), |env| {
             Ok(ir::AssociatedTyValueBound {
                 ty: self.value.lower(env)?,
@@ -1045,11 +950,11 @@ impl LowerTrait for TraitDefn {
 }
 
 pub trait LowerGoal<A> {
-    fn lower(&self, arg: &A) -> Result<Box<ir::Goal>>;
+    fn lower(&self, arg: &mut A) -> Result<Box<ir::Goal>>;
 }
 
 impl LowerGoal<ir::Program> for Goal {
-    fn lower(&self, program: &ir::Program) -> Result<Box<ir::Goal>> {
+    fn lower(&self, program: &mut ir::Program) -> Result<Box<ir::Goal>> {
         let associated_ty_infos: BTreeMap<_, _> = program
             .associated_ty_data
             .iter()
@@ -1066,19 +971,13 @@ impl LowerGoal<ir::Program> for Goal {
             })
             .collect();
 
-        let env = Env {
-            type_ids: &program.type_ids,
-            type_kinds: &program.type_kinds,
-            associated_ty_infos: &associated_ty_infos,
-            parameter_map: BTreeMap::new(),
-        };
-
-        self.lower(&env)
+        let mut env = Env::empty(&program.type_ids, &program.type_kinds, &associated_ty_infos);
+        self.lower(&mut env)
     }
 }
 
 impl<'k> LowerGoal<Env<'k>> for Goal {
-    fn lower(&self, env: &Env<'k>) -> Result<Box<ir::Goal>> {
+    fn lower(&self, env: &mut Env<'k>) -> Result<Box<ir::Goal>> {
         match self {
             Goal::ForAll(ids, g) => {
                 g.lower_quantified(env, ir::QuantifierKind::ForAll, ids)
